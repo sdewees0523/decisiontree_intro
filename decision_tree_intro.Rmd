@@ -1,0 +1,289 @@
+---
+title: "Untitled"
+output: html_document
+date: "2024-02-11"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(here)
+library(tidyverse)
+library(caret)
+library(randomForest)
+library(vcd)
+library(partykit)
+library(ggparty)
+```
+
+```{r}
+## First just cleaning up the dataset. We only want the dependent variable and any independent variables we are interested in. 
+
+veg_change <- read.csv(here("veg_enviro_fire_drought.csv")) %>% 
+  dplyr::select(!X & !plot_number) %>% 
+  filter(dominant_veg_1930 == "chaparral" & dominant_veg_2009 %in% c("chaparral", "grass")) %>% 
+  dplyr::select(!dominant_veg_1930 & !secondary_veg_1930 & !dominant_cover_1930 & !secondary_veg_1930 & !dominant_cover_2009 & !secondary_veg_2009 & !secondary_cover_2009) %>% 
+  mutate(dominant_veg_2009 = as.factor(dominant_veg_2009)) %>% 
+  dplyr::select("dominant_veg_2009",
+                "secondary_cover_1930",
+                "aspect",
+                "slope",
+                "solar_radiation_summer", 
+                "solar_radiation_winter",
+                "road_dist",
+                "precipitation",
+                "max_vpd_jan",
+                "max_vpd_aug",
+                "silt",
+                "clay",
+                "available_water_supply",
+                "organic_matter",
+                "min_return_interval",
+                "min_anomaly")
+
+## Now lets make a training dataset with 80% of the data and a testing data set for the remaining 20%
+set.seed(123) #the below function is random, so setting seed ensures we get a consistent result
+training_selection <- createDataPartition(veg_change$secondary_cover_1930, p = 0.8, list = F) #This randomly selects row numbers to use for partitioning
+
+training_data <- veg_change[training_selection,] # using the above row numbers, we make our actual training dataset
+testing_data <- veg_change[-training_selection,] # and select the opposite rows to make a testing dataset
+
+
+
+#two important inputs that optimize your model results are ntree (the number of trees to create) and mtry (the number of independent variables to randomly select and try at a node). This is a little for loop I wrote to get you the best value for both at the same time. 
+for(x in c(seq(from = 500, to = 1000, by = 100))){
+  set.seed(123)
+tuneRF(training_data[-1],
+       training_data$dominant_veg_2009, 
+       ntreeTry=x,stepFactor = 1.5, 
+       improve = 0.01, 
+       trace =TRUE, 
+       plot = FALSE)}
+## We are looking for the smallest OOB error. Looks like 900 trees with mtry of 6
+```
+
+Now we can run the random forest :) 
+```{r}
+set.seed(123) # As implied in the name, random forest has a random aspect to how it runs, so set.seed ensures you get a consistent result
+
+
+conversion_rf <- randomForest(dominant_veg_2009 ~., data = training_data, #it takes a formula similar to glm etc. 
+                              type = prob,
+                              ntree = 900,
+                              mtry = 6,
+                              importance = TRUE)
+conversion_rf #This gives us some basic model info
+
+## I like to use kappa to evaluate my model results. Below is the workflow:
+
+set.seed(123)
+rf_prediction <- predict(conversion_rf, newdata = testing_data, type = "prob") %>% 
+  data.frame() %>% 
+  mutate(conversion = case_when(chaparral > 0.5 ~ "chaparral",
+                                grass > 0.5 ~ "grass")) #First, make prediction with the testing dataset
+
+rf_confusion_table <- table(testing_data$dominant_veg_2009, rf_prediction$conversion) #Then make a dataframe with actual and predicted
+Kappa(rf_confusion_table) #our kappa is 0.51, or "moderate agreement" for more info run '?Kappa'
+
+## Another useful visualization is to visualize the Mean Decrease in Accuracy for each variable. 
+
+rf_mda <- data.frame(conversion_rf[["importance"]]) %>% 
+  dplyr::select("MeanDecreaseAccuracy") %>% 
+  rownames_to_column(var = "variables")
+
+rf_plot <- ggplot(rf_mda, aes(fct_reorder(variables, MeanDecreaseAccuracy), MeanDecreaseAccuracy))+
+  geom_bar(stat= "identity")+
+  coord_flip() +
+  labs(x = "Variables",
+       y = "Mean decrease in accuracy")+
+  theme_classic()
+rf_plot
+```
+
+Lets also look at how to run a single decision tree and make the very messy output manuscript ready
+
+```{r}
+## With the data already prepped its this easy!
+set.seed(123)
+chap_model <- ctree(dominant_veg_2009 ~., data = training_data)
+# We can also get the kappa for this model
+predicted_chap <- chap_model %>% 
+  predict(testing_data)
+chap_confusion <- table(testing_data$dominant_veg_2009, predicted_chap)
+Kappa(chap_confusion) ## We can see it doesn't preform as well as the random forest
+
+# And lets see what the raw plot looks like
+plot(chap_model)
+```
+
+
+## Don't worry though, we can customize it to the extreme!!!!!!!!
+```{r}
+#First lets rename the variables so they display nice and pretty and then rerun the model
+tree_chap_conversion <- training_data %>% 
+  rename("percent secondary cover \n in 1930" = "secondary_cover_1930") %>% 
+  rename("maximum January VPD" = "max_vpd_jan") %>% 
+  rename("mean annual \n precipitation" = "precipitation")
+
+## This is the basic format, we can see the output is similar to above. 
+clean_tree <- ggparty(chap_model) +
+  geom_edge() +
+  geom_edge_label() +
+  geom_node_splitvar()
+
+clean_tree
+```
+
+## geom_node_splitvar lets us customize the node labels. Below we will make them bigger and get rid of the box around them. 
+```{r}
+clean_tree <- ggparty(chap_model) +
+  geom_edge() +
+  geom_edge_label() +
+  geom_node_splitvar(size = 4, label.size = 0)
+clean_tree
+```
+
+## geom edge label lets us customize the split numbers. Unfortunately the round function doesn't work, but I have sleuthed up how to get the values rounded. We can also move where on the line they are. 
+
+```{r}
+clean_tree <- ggparty(chap_model) +
+  geom_edge() +
+  geom_edge_label(mapping = aes(label = paste(substr(breaks_label, start = 1, stop = 15))),
+                  shift = 0.75,
+                  size = 3) +
+  geom_node_splitvar(size = 4, label.size = 0)
+
+clean_tree
+```
+
+##Hmm, that shift worked for some, but made others worse. Luckily we can use multiple geom edge label functions and add an 'ids' argument to specify which ones to apply that call to. Ids isn't always super intuitive and I kind of just trial and error to see which ones are which. 
+
+```{r}
+clean_tree <- ggparty(chap_model) +
+  geom_edge() +
+  geom_edge_label(mapping = aes(label = paste(substr(breaks_label, start = 1, stop = 15))),
+                  ids = c(3,4,7,8),
+                  shift = 0.75,
+                  size = 3) +
+  geom_edge_label(mapping = aes(label = paste(substr(breaks_label, start = 1, stop = 15))),
+                  ids = c(2,5,6,9),
+                  size = 3) +
+  geom_node_splitvar(size = 4, label.size = 0)
+clean_tree
+```
+
+## Finally, we can add the end node plots with geom_node_plot
+
+
+
+```{r}
+clean_tree <- ggparty(chap_model) +
+  geom_edge() +
+  geom_edge_label(mapping = aes(label = paste(substr(breaks_label, start = 1, stop = 15))),
+                  ids = c(3,4,7,8),
+                  shift = 0.75,
+                  size = 3) +
+  geom_edge_label(mapping = aes(label = paste(substr(breaks_label, start = 1, stop = 15))),
+                  ids = c(2,5,6,9),
+                  size = 3) +
+  geom_node_splitvar(size = 4, label.size = 0) +
+  geom_node_plot(gglist = list(geom_bar(aes(x = "", fill = dominant_veg_2009),
+                                        position = position_fill()),
+                               scale_fill_brewer(palette = "PuBuGn"),
+                               theme_classic(),
+                               theme(text = element_text(size = 10),
+                                     axis.title.y = element_text(margin = ggplot2::margin(r = 50))),
+                               theme(axis.text.x = element_blank(),
+                                     axis.ticks = element_blank()),
+                               labs(fill = "Vegetation type",
+                                    y = "Proportion of \n dominant vegetation",
+                                    x ="")),
+                 shared_axis_labels = TRUE)
+clean_tree
+```
+
+## But that messed up some of the edge label positions, so lets fix
+
+```{r}
+
+clean_tree <- ggparty(chap_model) +
+  geom_edge() +
+  geom_edge_label(mapping = aes(label = paste(substr(breaks_label, start = 1, stop = 15))),
+                  ids = c(3,4,7,8),
+                  shift = 0.75,
+                  size = 3) +
+  geom_edge_label(mapping = aes(label = paste(substr(breaks_label, start = 1, stop = 15))),
+                  ids = c(6,9),
+                  shift = 0.6,
+                  size = 3) +
+  geom_edge_label(mapping = aes(label = paste(substr(breaks_label, start = 1, stop = 15))),
+                  ids = c(2,5),
+                  shift = 0.4,
+                  size = 3) +
+  geom_node_splitvar(size = 4, label.size = 0) +
+  geom_node_plot(gglist = list(geom_bar(aes(x = "", fill = dominant_veg_2009),
+                                        position = position_fill()),
+                               scale_fill_brewer(palette = "PuBuGn"),
+                               theme_classic(),
+                               theme(text = element_text(size = 10),
+                                     axis.title.y = element_text(margin = ggplot2::margin(r = 50))),
+                               theme(axis.text.x = element_blank(),
+                                     axis.ticks = element_blank()),
+                               labs(fill = "Vegetation type",
+                                    y = "Proportion of \n dominant vegetation",
+                                    x ="")),
+                 shared_axis_labels = TRUE)
+clean_tree
+
+
+```
+
+## Finally for real, just to show how to change individual node plots, you just use the ids argument. 
+
+```{r}
+clean_tree <- ggparty(chap_model) +
+  geom_edge() +
+  geom_edge_label(mapping = aes(label = paste(substr(breaks_label, start = 1, stop = 15))),
+                  ids = c(3,4,7,8),
+                  shift = 0.75,
+                  size = 3) +
+  geom_edge_label(mapping = aes(label = paste(substr(breaks_label, start = 1, stop = 15))),
+                  ids = c(6,9),
+                  shift = 0.6,
+                  size = 3) +
+  geom_edge_label(mapping = aes(label = paste(substr(breaks_label, start = 1, stop = 15))),
+                  ids = c(2,5),
+                  shift = 0.4,
+                  size = 3) +
+  geom_node_splitvar(size = 4, label.size = 0) +
+  geom_node_plot(ids = c(3,4),
+                 gglist = list(geom_bar(aes(x = "", fill = dominant_veg_2009),
+                                        position = position_fill()),
+                               scale_fill_brewer(palette = "PuBuGn"),
+                               theme_classic(),
+                               theme(text = element_text(size = 10),
+                                     axis.title.y = element_text(margin = ggplot2::margin(r = 50))),
+                               theme(axis.text.x = element_blank(),
+                                     axis.ticks = element_blank()),
+                               labs(fill = "Vegetation type",
+                                    y = "Proportion of \n dominant vegetation",
+                                    x ="")),
+                 shared_axis_labels = TRUE)+
+  geom_node_plot(ids = c(7,8,9),
+                 gglist = list(geom_bar(aes(x = "", fill = dominant_veg_2009),
+                                        position = position_fill()),
+                               scale_fill_brewer(palette = 1),
+                               theme_classic(),
+                               theme(text = element_text(size = 10),
+                                     axis.title.y = element_text(margin = ggplot2::margin(r = 50))),
+                               theme(axis.text.x = element_blank(),
+                                     axis.ticks = element_blank()),
+                               labs(fill = "Vegetation type",
+                                    y = "Proportion of \n dominant vegetation",
+                                    x ="")),
+                 shared_axis_labels = TRUE)
+clean_tree
+```
+
+# And voila 
+
+
